@@ -1,0 +1,646 @@
+========================================
+КОМАНДЫ WINDOWS CMD ДЛЯ ПРОВЕРКИ ПРОЕКТА
+========================================
+
+ВАЖНЫЕ ЗАМЕЧАНИЯ:
+- Все команды для Windows CMD (НЕ PowerShell)
+- Проект использует mTLS с ClientAuth.REQUIRE
+- MQTT TLS порт: 8884 (plaintext 1883 отключен)
+- База данных PostgreSQL (mqtt, пользователь postgres, пароль postgres, порт 5432)
+- Схема БД создается автоматически при первом запуске
+- Протоколы: TLSv1.3, TLSv1.2
+
+========================================
+
+==================================================
+1. ПРОВЕРКА ОКРУЖЕНИЯ
+==================================================
+
+REM Проверка версии Java (должна быть JDK 17)
+java -version
+
+REM Проверка Maven
+mvn -version
+
+REM Проверка доступности keytool
+keytool
+
+REM Проверка PostgreSQL
+psql --version
+
+REM Проверка что PostgreSQL запущен
+sc query postgresql-x64-*
+
+REM Переход в директорию проекта
+cd C:\Users\vasya\OneDrive\Desktop\DICSS
+
+==================================================
+2. НАСТРОЙКА POSTGRESQL
+==================================================
+
+REM Создание базы данных mqtt
+psql -U postgres -c "CREATE DATABASE mqtt;"
+
+REM Проверка создания БД
+psql -U postgres -lqt | findstr mqtt
+
+REM Подключение к БД mqtt для проверки
+psql -U postgres -d mqtt -c "SELECT version();"
+
+REM Схема БД создается автоматически при первом запуске DatabaseManager
+REM Файл схемы: device-registry/src/main/resources/schema.sql
+
+==================================================
+3. ГЕНЕРАЦИЯ СЕРТИФИКАТОВ (только keytool)
+==================================================
+
+REM Генерация серверного keystore с SAN
+keytool -genkeypair -alias moquette -keyalg RSA -keysize 2048 -validity 825 -keystore server-keystore.p12 -storetype PKCS12 -storepass changeit -keypass changeit -dname "CN=localhost, OU=IoT, O=Home, L=City, ST=State, C=US" -ext "SAN=DNS:localhost,IP:127.0.0.1"
+
+REM Экспорт серверного сертификата
+keytool -exportcert -alias moquette -keystore server-keystore.p12 -storetype PKCS12 -storepass changeit -file server-cert.cer
+
+REM Генерация клиентского keystore
+keytool -genkeypair -alias iot-client -keyalg RSA -keysize 2048 -validity 825 -keystore client.p12 -storetype PKCS12 -storepass changeit -keypass changeit -dname "CN=iot-simulator, OU=Device, O=Home, L=City, ST=State, C=US"
+
+REM Экспорт клиентского сертификата
+keytool -exportcert -alias iot-client -keystore client.p12 -storetype PKCS12 -storepass changeit -file client-cert.cer
+
+REM Создание broker truststore и импорт клиентского сертификата
+keytool -importcert -alias iot-client -file client-cert.cer -keystore broker-truststore.p12 -storetype PKCS12 -storepass changeit -noprompt
+
+REM Создание client truststore и импорт серверного сертификата
+keytool -importcert -alias moquette -file server-cert.cer -keystore client-truststore.p12 -storetype PKCS12 -storepass changeit -noprompt
+
+REM Проверка серверного keystore
+keytool -list -v -keystore server-keystore.p12 -storetype PKCS12 -storepass changeit
+
+REM Проверка клиентского keystore
+keytool -list -v -keystore client.p12 -storetype PKCS12 -storepass changeit
+
+REM Проверка broker truststore
+keytool -list -keystore broker-truststore.p12 -storetype PKCS12 -storepass changeit
+
+REM Проверка client truststore
+keytool -list -keystore client-truststore.p12 -storetype PKCS12 -storepass changeit
+
+==================================================
+4. СБОРКА ПРОЕКТА
+==================================================
+
+REM Очистка и сборка всех модулей (тихий режим, без тестов)
+mvn -q -DskipTests clean package
+
+REM Проверка наличия fat-jar
+dir demo-runner\target\demo-runner-*.jar
+
+REM Ожидается: demo-runner-1.0-SNAPSHOT.jar (~9 МБ)
+
+REM Проверка наличия WAR
+dir backend-payara\target\backend-payara.war
+
+REM Ожидается: backend-payara.war (~2.3 МБ)
+
+==================================================
+5. ПОЗИТИВНЫЙ ТЕСТ - ЗАПУСК DEMO С ПОЛНОЙ СИСТЕМОЙ БЕЗОПАСНОСТИ
+==================================================
+
+REM Запуск demo с автоматической инициализацией устройств
+java -jar demo-runner\target\demo-runner-1.0-SNAPSHOT.jar
+
+REM Ожидаемый вывод:
+REM - Demo devices initialization completed (5 устройств)
+REM - Connected to PostgreSQL database: jdbc:postgresql://localhost:5432/mqtt
+REM - Database schema created successfully
+REM - Moquette MQTT broker started successfully on ssl://localhost:8884
+REM - Plaintext port 1883 is DISABLED (set to 0)
+REM - Client authentication is REQUIRED (mTLS)
+REM - Device interceptor registered for authentication and monitoring
+REM - Health check monitoring service started
+REM - All devices started successfully
+REM - Testing Device Cloning Detection
+REM - Demo completed successfully
+
+REM Проверка таблиц в PostgreSQL БД
+psql -U postgres -d mqtt -c "\dt"
+
+REM Ожидается: список таблиц (devices, device_connections, security_alerts, telemetry, client_bindings, audit_logs)
+
+REM Проверка количества устройств в БД
+psql -U postgres -d mqtt -c "SELECT COUNT(*) FROM devices;"
+
+REM Ожидается: 5 устройств
+
+==================================================
+6. ПРОВЕРКА ПОРТОВ
+==================================================
+
+REM Проверка что plaintext порт 1883 не открыт
+netstat -ano | findstr :1883
+
+REM Ожидается: Нет вывода (порт отключен)
+
+REM Проверка что TLS порт 8884 свободен (после завершения demo)
+netstat -ano | findstr :8884
+
+REM Ожидается: Нет активных LISTEN соединений
+
+==================================================
+7. НЕГАТИВНЫЕ ТЕСТЫ - ПРОВЕРКА mTLS
+==================================================
+
+REM Тест 1: Неверный пароль клиентского keystore
+java -Dclient.keystore.password=wrongpassword -jar demo-runner\target\demo-runner-1.0-SNAPSHOT.jar
+
+REM Ожидается: UnrecoverableKeyException, подключение не удалось
+
+REM Тест 2: Отсутствующий client truststore
+java -Dclient.truststore=nonexistent.p12 -jar demo-runner\target\demo-runner-1.0-SNAPSHOT.jar
+
+REM Ожидается: FileNotFoundException, SSL handshake не проходит
+
+==================================================
+8. РАЗВЕРТЫВАНИЕ И ПРОВЕРКА PAYARA 6 С POSTGRESQL
+==================================================
+
+REM Создание домена mqtt-demo (HTTP на порту 9080)
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat create-domain --portbase 9000 --nopassword mqtt-demo
+
+REM Ожидается: Domain mqtt-demo created
+REM Admin порт: 9048
+REM HTTP порт: 9080
+
+REM Запуск домена
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat start-domain mqtt-demo
+
+REM Ожидание запуска (15 секунд)
+ping -n 16 127.0.0.1 >nul
+
+REM Создание директории mqtt конфигурации
+mkdir C:\Users\vasya\OneDrive\Desktop\payara6\glassfish\domains\mqtt-demo\config\mqtt
+
+REM Копирование клиентских сертификатов
+copy client.p12 C:\Users\vasya\OneDrive\Desktop\payara6\glassfish\domains\mqtt-demo\config\mqtt\
+copy client-truststore.p12 C:\Users\vasya\OneDrive\Desktop\payara6\glassfish\domains\mqtt-demo\config\mqtt\
+
+REM ================================================
+REM НАСТРОЙКА POSTGRESQL JDBC DRIVER В PAYARA
+REM ================================================
+
+REM Копирование PostgreSQL JDBC драйвера в Payara lib
+copy %USERPROFILE%\.m2\repository\org\postgresql\postgresql\42.7.3\postgresql-42.7.3.jar C:\Users\vasya\OneDrive\Desktop\payara6\glassfish\lib\
+
+REM Ожидается: файл скопирован
+
+REM Перезапуск домена для применения драйвера
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 restart-domain mqtt-demo
+
+REM Ожидание перезапуска (15 секунд)
+ping -n 16 127.0.0.1 >nul
+
+REM ================================================
+REM СОЗДАНИЕ JDBC CONNECTION POOL ДЛЯ POSTGRESQL
+REM ================================================
+
+REM Создание JDBC Connection Pool для PostgreSQL
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 create-jdbc-connection-pool --datasourceclassname org.postgresql.ds.PGSimpleDataSource --restype javax.sql.DataSource --property user=postgres:password=postgres:serverName=localhost:portNumber=5432:databaseName=mqtt MqttPostgresPool
+
+REM Ожидается: JDBC connection pool MqttPostgresPool created successfully
+
+REM Создание JDBC Resource
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 create-jdbc-resource --connectionpoolid MqttPostgresPool jdbc/MqttDB
+
+REM Ожидается: JDBC resource jdbc/MqttDB created successfully
+
+REM Проверка connection pool
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 ping-connection-pool MqttPostgresPool
+
+REM Ожидается: Command ping-connection-pool executed successfully
+
+REM ================================================
+REM СОЗДАНИЕ JMS РЕСУРСОВ
+REM ================================================
+
+REM JMS Connection Factory для отправки сообщений в очередь
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 create-jms-resource --restype jakarta.jms.ConnectionFactory --property ClientId=payara-mqtt jms/ConnectionFactory
+
+REM Ожидается: Connector resource jms/ConnectionFactory created
+
+REM JMS Queue для телеметрии (monitoring-only)
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 create-jms-resource --restype jakarta.jms.Queue jms/telemetryQueue
+
+REM Ожидается: Administered object jms/telemetryQueue created
+
+REM Проверка создания JMS ресурсов (Connection Factory)
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 list-connector-resources
+
+REM Ожидается: jms/ConnectionFactory в списке
+
+REM Проверка создания JMS ресурсов (Queue)
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 list-admin-objects
+
+REM Ожидается: jms/telemetryQueue в списке
+
+REM ================================================
+REM НАСТРОЙКА SYSTEM PROPERTIES
+REM ================================================
+
+REM Настройка MQTT свойств через system properties
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 create-system-properties mqtt.host=localhost
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 create-system-properties mqtt.port=8884
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 create-system-properties "mqtt.client.keystore.path=C\:/Users/vasya/OneDrive/Desktop/payara6/glassfish/domains/mqtt-demo/config/mqtt/client.p12"
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 create-system-properties mqtt.client.keystore.password=changeit
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 create-system-properties "mqtt.client.truststore.path=C\:/Users/vasya/OneDrive/Desktop/payara6/glassfish/domains/mqtt-demo/config/mqtt/client-truststore.p12"
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 create-system-properties mqtt.client.truststore.password=changeit
+
+REM Настройка PostgreSQL свойств (опционально, DatabaseManager использует дефолтные значения)
+REM ВНИМАНИЕ: Команда create-system-properties не поддерживает двоеточие в значениях
+REM DatabaseManager использует дефолт: jdbc:postgresql://localhost:5432/mqtt
+REM Если нужно изменить, можно использовать переменные окружения или редактировать domain.xml напрямую
+
+REM Перезапуск домена для применения properties
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 restart-domain mqtt-demo
+
+REM Ожидание перезапуска (15 секунд)
+ping -n 16 127.0.0.1 >nul
+
+REM ================================================
+REM ДЕПЛОЙ WAR
+REM ================================================
+
+REM Деплой WAR (первый раз)
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 deploy backend-payara\target\backend-payara.war
+
+REM Ожидается: Application deployed with name backend-payara
+
+REM Если WAR уже задеплоен, использовать force:
+REM C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 deploy --force=true backend-payara\target\backend-payara.war
+
+REM ================================================
+REM В ОТДЕЛЬНОМ ОКНЕ CMD: Запуск брокера в режиме broker-only
+REM ================================================
+REM cd C:\Users\vasya\OneDrive\Desktop\DICSS
+REM java -Dmode=broker-only -jar demo-runner\target\demo-runner-1.0-SNAPSHOT.jar
+REM
+REM Ожидается: 
+REM - Mode: broker-only
+REM - Moquette MQTT broker started successfully on ssl://localhost:8884
+REM - Broker-only mode: Broker is running. Press Ctrl+C to stop.
+REM - Broker работает бесконечно до Ctrl+C
+REM ================================================
+
+REM Ожидание запуска брокера
+ping -n 6 127.0.0.1 >nul
+
+REM Undeploy и повторный deploy для подключения к брокеру
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 undeploy backend-payara
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 deploy backend-payara\target\backend-payara.war
+
+REM Ожидание инициализации
+ping -n 6 127.0.0.1 >nul
+
+REM Тест API status endpoint
+C:\Windows\System32\curl.exe http://localhost:9080/backend-payara/api/telemetry/status
+
+REM Ожидается: {"status": "MQTT backend is running"}
+
+REM ПУБЛИКАЦИЯ ИЗ ОБЛАКА ЗАПРЕЩЕНА (monitoring-only): endpoint отключен и возвращает 403
+REM C:\Windows\System32\curl.exe -X POST http://localhost:9080/backend-payara/api/telemetry/publish -H "Content-Type: text/plain" -d "disabled"
+REM Ожидается: HTTP 403 Forbidden
+
+REM Тест Admin API - все устройства
+C:\Windows\System32\curl.exe http://localhost:9080/backend-payara/api/devices
+
+REM Ожидается: JSON массив с устройствами (может быть пустым, если устройства не запущены)
+
+REM Тест Admin API - pending устройства
+C:\Windows\System32\curl.exe http://localhost:9080/backend-payara/api/devices/pending
+
+REM Ожидается: JSON массив с устройствами в статусе PENDING
+
+REM Тест Admin API - security alerts
+C:\Windows\System32\curl.exe http://localhost:9080/backend-payara/api/alerts
+
+REM Ожидается: JSON массив с alerts
+
+REM Тест Admin API - последние alerts
+C:\Windows\System32\curl.exe http://localhost:9080/backend-payara/api/alerts/recent?limit=5
+
+REM Ожидается: JSON массив с 5 последними alerts
+
+REM Тест Admin API - активные подключения
+C:\Windows\System32\curl.exe http://localhost:9080/backend-payara/api/connections/active
+
+REM Ожидается: JSON массив с активными подключениями
+
+REM Тест Admin API - одобрение устройства (пример для ID=1)
+C:\Windows\System32\curl.exe -X POST "http://localhost:9080/backend-payara/api/devices/1/approve?admin=TestAdmin"
+
+REM Ожидается: {"message": "Device approved successfully"}
+
+REM Проверка логов Payara на подключение к PostgreSQL
+type C:\Users\vasya\OneDrive\Desktop\payara6\glassfish\domains\mqtt-demo\logs\server.log | findstr /C:"PostgreSQL database"
+
+REM Ожидается: Connected to PostgreSQL database: jdbc:postgresql://localhost:5432/mqtt
+
+REM Проверка подключения Publisher в логах
+type C:\Users\vasya\OneDrive\Desktop\payara6\glassfish\domains\mqtt-demo\logs\server.log | findstr /C:"Publisher client connected"
+
+REM Ожидается: MQTT Publisher client connected
+
+REM Проверка подключения Subscriber в логах
+type C:\Users\vasya\OneDrive\Desktop\payara6\glassfish\domains\mqtt-demo\logs\server.log | findstr /C:"Subscriber client connected"
+
+REM Ожидается: MQTT Subscriber client connected and subscribed to 'home/+/devices/+/telemetry'
+
+REM Остановка broker-only процесса (Ctrl+C в окне брокера)
+
+REM Удаление WAR из Payara
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 undeploy backend-payara
+
+REM Остановка домена mqtt-demo
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat --port 9048 stop-domain mqtt-demo
+
+REM Удаление домена mqtt-demo (очистка)
+C:\Users\vasya\OneDrive\Desktop\payara6\bin\asadmin.bat delete-domain mqtt-demo
+
+==================================================
+9. ПРОВЕРКА ЛОКАЛЬНОГО КОНТРОЛЛЕРА (HTTPS+mTLS)
+==================================================
+
+REM Запуск ControllerWebServer отдельно (без demo):
+REM java -cp demo-runner\target\demo-runner-1.0-SNAPSHOT.jar io.home.test.StartControllerWebServer
+REM
+REM Или контроллер стартует из DemoMain автоматически, порт по умолчанию: 11080, только localhost, HTTPS+mTLS, Basic Auth
+REM
+REM ВАЖНО: Команды curl с mTLS могут не работать на Windows из-за ограничений Schannel.
+REM Рекомендуется использовать Java тест для проверки ControllerWebServer:
+REM java -cp demo-runner\target\demo-runner-1.0-SNAPSHOT.jar io.home.test.ControllerWebServerTest
+REM
+REM Пример запросов через curl (может не работать на Windows):
+
+REM Статус
+C:\Windows\System32\curl.exe -k --cert-type P12 --cert client.p12:changeit -u admin:changeit https://127.0.0.1:11080/status
+
+REM Метрики (ожидается devices>0, telemetry>0 после запуска demo)
+C:\Windows\System32\curl.exe -k --cert-type P12 --cert client.p12:changeit -u admin:changeit https://127.0.0.1:11080/metrics
+
+REM Недавние алерты
+C:\Windows\System32\curl.exe -k --cert-type P12 --cert client.p12:changeit -u admin:changeit "https://127.0.0.1:11080/alerts/recent?limit=10"
+
+REM Pairing: выдача кода
+C:\Windows\System32\curl.exe -k --cert-type P12 --cert client.p12:changeit -u admin:changeit https://127.0.0.1:11080/pairing/start
+
+REM Pairing: завершение (пример)
+C:\Windows\System32\curl.exe -k --cert-type P12 --cert client.p12:changeit -u admin:changeit -H "Content-Type: application/json" -d "{\"code\":\"ABCDEFGH\",\"uuid\":\"11111111-2222-3333-4444-555555555555\",\"fingerprint\":\"test-fp\",\"role\":\"admin\"}" https://127.0.0.1:11080/pairing/complete
+
+==================================================
+10. ПРОВЕРКА POSTGRESQL БД
+==================================================
+
+REM Подключение к БД mqtt
+psql -U postgres -d mqtt
+
+REM В psql консоли:
+REM \dt - список таблиц
+REM SELECT COUNT(*) FROM devices; - количество устройств
+REM SELECT * FROM devices LIMIT 5; - первые 5 устройств
+REM SELECT COUNT(*) FROM telemetry; - количество записей телеметрии
+REM SELECT COUNT(*) FROM security_alerts; - количество алертов
+REM \q - выход
+
+REM Или одной командой:
+psql -U postgres -d mqtt -c "SELECT COUNT(*) FROM devices;"
+
+REM Проверка структуры таблицы devices
+psql -U postgres -d mqtt -c "\d devices"
+
+REM Проверка данных телеметрии
+psql -U postgres -d mqtt -c "SELECT COUNT(*) FROM telemetry;"
+
+REM Проверка алертов безопасности
+psql -U postgres -d mqtt -c "SELECT COUNT(*) FROM security_alerts;"
+
+REM Проверка активных подключений
+psql -U postgres -d mqtt -c "SELECT COUNT(*) FROM device_connections WHERE disconnected_at IS NULL;"
+
+==================================================
+11. ФИНАЛЬНАЯ ПРОВЕРКА
+==================================================
+
+REM Проверка что порты свободны
+netstat -ano | findstr :1883
+netstat -ano | findstr :8884
+
+REM Ожидается: Нет вывода (порты свободны)
+
+REM Проверка созданных файлов
+dir *.p12
+dir *.cer
+
+REM Ожидается:
+REM - 4 файла *.p12 (server-keystore, client, broker-truststore, client-truststore)
+REM - 2 файла *.cer (server-cert, client-cert)
+
+REM Проверка PostgreSQL JDBC драйвера в Payara
+dir C:\Users\vasya\OneDrive\Desktop\payara6\glassfish\lib\postgresql-42.7.3.jar
+
+REM Ожидается: файл существует
+
+==================================================
+ЗАВЕРШЕНИЕ ПРОВЕРКИ
+==================================================
+
+ВЫПОЛНЕННЫЕ ТЕСТЫ:
+[+] Java 17 проверена
+[+] Maven сборка успешна
+[+] PostgreSQL JDBC драйвер добавлен в проект (версия 42.7.3)
+[+] Серверный keystore с SAN (DNS:localhost, IP:127.0.0.1)
+[+] Клиентский keystore (alias: iot-client)
+[+] Broker truststore с клиентским сертификатом
+[+] Client truststore с серверным сертификатом
+[+] Fat-jar: demo-runner-1.0-SNAPSHOT.jar (~9 МБ)
+[+] WAR: backend-payara.war (~2.3 МБ)
+[+] База данных PostgreSQL: mqtt (пользователь postgres, пароль postgres, порт 5432)
+[+] Схема БД создается автоматически при первом запуске
+[+] ПОЗИТИВНЫЙ ТЕСТ: Demo запущен и завершен успешно
+[+] 5 демо-устройств инициализировано (APPROVED статус)
+[+] Устройства подключились через mTLS
+[+] Device interceptor зарегистрирован
+[+] Health check мониторинг запущен (интервал 2 минуты)
+[+] Тест клонирования выполнен
+[+] Security alerts создаются автоматически
+[+] НЕГАТИВНЫЙ ТЕСТ: Неверный пароль keystore (UnrecoverableKeyException)
+[+] НЕГАТИВНЫЙ ТЕСТ: Отсутствующий truststore (FileNotFoundException)
+[+] Домен Payara mqtt-demo создан и протестирован
+[+] PostgreSQL JDBC драйвер загружен в Payara (glassfish/lib/postgresql-42.7.3.jar)
+[+] JDBC Connection Pool создан (MqttPostgresPool)
+[+] JDBC Resource создан (jdbc/MqttDB)
+[+] JMS ресурсы созданы: jms/ConnectionFactory и jms/telemetryQueue
+[+] REST API endpoints работают (/api/devices, /api/alerts, /api/connections, /api/telemetry)
+[+] MQTT Publisher подключился к broker через mTLS
+[+] MQTT Subscriber подключился к broker через mTLS
+[+] Subscriber получил сообщения от Publisher успешно
+[+] Порт 1883 plaintext: ОТКЛЮЧЕН
+[+] Порт 8884 SSL/TLS: работает с mTLS
+[+] broker-only режим реализован и протестирован
+
+КЛЮЧЕВЫЕ ФУНКЦИИ БЕЗОПАСНОСТИ:
+- mTLS принудительно включен: ClientAuth.REQUIRE
+- Протоколы: TLSv1.3, TLSv1.2
+- Порт 1883 ОТКЛЮЧЕН (set to 0)
+- Device Registry: PostgreSQL база данных с таблицами devices, device_connections, security_alerts, telemetry, client_bindings, audit_logs
+- Device Authentication: SHA-256 composite hash (serial + MAC)
+- Health Check: мониторинг каждые 60 сек от устройств, проверка каждые 2 мин
+- Cloning Detection: обнаружение дублирующих подключений
+- Security Alerts: автоматическое создание для всех нарушений
+- JSON парсинг: полная валидация registration и health check
+- Admin Service: одобрение/отклонение/разблокировка устройств
+- REST API: управление устройствами, просмотр alerts, мониторинг подключений
+
+ТИПЫ УСТРОЙСТВ:
+- TEMP_SENSOR: датчик температуры и влажности
+- SMART_PLUG: умная розетка
+- ENERGY_SENSOR: датчик энергопотребления
+- SMART_SWITCH: умный выключатель
+
+СТАТУСЫ УСТРОЙСТВ:
+- PENDING: ожидает одобрения администратора
+- APPROVED: одобрено и может подключаться
+- REJECTED: отклонено администратором
+- BLOCKED: заблокировано системой безопасности
+
+ТИПЫ SECURITY ALERTS:
+- DEVICE_REGISTRATION: новое устройство зарегистрировано
+- DEVICE_CLONE_DETECTED: обнаружено клонирование устройства
+- CRITICAL_DEVICE_CLONE_ATTEMPT: попытка клонирования критического устройства
+- DEVICE_RECONNECTION: устройство переподключилось
+- DEVICE_OFFLINE: устройство неактивно >3 минут
+- MAC_MISMATCH: несоответствие MAC адреса
+- TIME_DRIFT: рассинхронизация времени >5 минут
+- HEALTH_CHECK_ERROR: ошибка обработки health check
+- REGISTRATION_ERROR: ошибка регистрации
+- CONNECTION_ERROR: ошибка подключения
+
+ПОРТЫ И ПРОТОКОЛЫ:
+- MQTT TLS: 8884 (только mTLS, plaintext отключен)
+- REST API: 9080 (при деплое в Payara на домене mqtt-demo)
+- Admin API: 9048 (Payara asadmin для mqtt-demo)
+- PostgreSQL: 5432 (база данных mqtt, пользователь postgres, пароль postgres)
+- Протоколы: TLSv1.3, TLSv1.2
+
+ВСЕ ТРЕБОВАНИЯ ВЫПОЛНЕНЫ:
+[+] Встроенный брокер Moquette с mTLS
+[+] ClientAuth.REQUIRE принудительно
+[+] Протоколы ограничены TLSv1.3 и TLSv1.2
+[+] Порт 1883 отключен
+[+] Eclipse Paho v3 клиентская библиотека
+[+] Jakarta EE 10 WAR для Payara 6
+[+] PostgreSQL база данных для device registry
+[+] SHA-256 хеширование идентификаторов
+[+] Health check мониторинг
+[+] Обнаружение клонирования устройств
+[+] Security alerts система
+[+] AdminService для управления
+[+] REST API для администрирования
+[+] JSON парсинг и валидация
+[+] Все сертификаты через keytool
+[+] Все тесты через Windows CMD/PowerShell
+[+] AdminService: добавлен no-arg конструктор для CDI
+[+] REST API: исправлены пути (убрано дублирование /api)
+[+] REST API: исправлен @Consumes в DeviceResource и ConnectionResource (убран с уровня класса для POST методов без тела)
+[+] MqttConfig: исправлен дефолтный порт с 8883 на 8884
+[+] DemoMain: реализован broker-only режим (бесконечная работа)
+[+] ControllerWebServer: добавлен класс StartControllerWebServer для независимого запуска
+[+] WINDOWS_CMDS_USED.txt обновлен для PostgreSQL и актуализирован
+
+ВАЖНЫЕ ЗАМЕЧАНИЯ ПРИ РАБОТЕ С PAYARA:
+- Для повторного деплоя использовать: deploy --force=true
+- Broker должен быть запущен ДО деплоя WAR для успешного MQTT подключения
+- После изменения system properties нужен restart-domain
+- JMS ресурсы создаются один раз после создания домена (jms/ConnectionFactory и jms/telemetryQueue)
+- PostgreSQL JDBC драйвер должен быть скопирован в glassfish/lib/ перед созданием Connection Pool
+- После копирования драйвера необходим restart-domain
+- Логи Payara: C:\Users\vasya\OneDrive\Desktop\payara6\glassfish\domains\mqtt-demo\logs\server.log
+
+JDBC CONNECTION POOL PAYARA:
+- Имя пула: MqttPostgresPool
+- DataSource: org.postgresql.ds.PGSimpleDataSource
+- JDBC Resource: jdbc/MqttDB
+- Параметры подключения: user=postgres, password=postgres, serverName=localhost, portNumber=5432, databaseName=mqtt
+- Проверка: ping-connection-pool MqttPostgresPool
+
+JMS РЕСУРСЫ PAYARA:
+- jms/ConnectionFactory: Connection Factory для MQTT телеметрии (ClientId=payara-mqtt)
+- jms/telemetryQueue: Queue для мониторинга телеметрии (monitoring-only архитектура)
+- Используется TelemetryEventProducer для отправки телеметрии из MQTT Subscriber в JMS Queue
+
+POSTGRESQL НАСТРОЙКИ:
+- База данных: mqtt
+- Пользователь: postgres
+- Пароль: postgres
+- Порт: 5432
+- JDBC URL: jdbc:postgresql://localhost:5432/mqtt
+- JDBC драйвер: PostgreSQL JDBC Driver 42.7.3 (org.postgresql:postgresql:42.7.3)
+- Схема создается автоматически при первом запуске DatabaseManager
+- Файл схемы: device-registry/src/main/resources/schema.sql
+
+==================================================
+12. ТЕСТИРОВАНИЕ УГРОЗ БЕЗОПАСНОСТИ
+==================================================
+
+REM Сборка модуля threat-testing
+mvn -q -DskipTests clean package -pl threat-testing -am
+
+REM Проверка наличия threat-testing jar
+dir threat-testing\target\threat-testing-*.jar
+
+REM Ожидается: threat-testing-1.0-SNAPSHOT.jar (~9 МБ)
+
+REM Запуск всех тестов угроз безопасности
+java -jar threat-testing\target\threat-testing-1.0-SNAPSHOT.jar
+
+REM Ожидается:
+REM - Запуск 5 тестов угроз:
+REM   1. Threat 6: Несанкционированное подключение к MQTT-брокеру
+REM   2. Threat 12: Перехват MQTT-сообщений при отсутствии TLS
+REM   3. Threat 14: Атака 'subscribe to all' на MQTT-брокер
+REM   4. Threat 30: Утечка конфиденциальной информации через MQTT топики
+REM   5. Threat 38: Несанкционированное управление электроснабжением через MQTT
+REM - Все тесты должны завершиться со статусом PASSED
+REM - Каждый тест проверяет, что защитные механизмы работают корректно
+
+REM Запуск тестов с указанием тестовой БД (опционально)
+REM java -Dtest.db.url=jdbc:postgresql://localhost:5432/test_mqtt -jar threat-testing\target\threat-testing-1.0-SNAPSHOT.jar
+
+REM Проверка результатов тестов в логах:
+REM - TEST PASSED: все тесты должны пройти успешно
+REM - TEST FAILED: защита не сработала (критическая ошибка)
+REM - TEST ERROR: ошибка выполнения теста (проверить конфигурацию)
+
+REM Проверка security alerts после тестов
+C:\Windows\System32\curl.exe http://localhost:9080/backend-payara/api/alerts/recent?limit=10
+
+REM Ожидается: список последних security alerts, включая alerts от тестов
+
+==================================================
+13. АНАЛИЗ ЗАЩИТНЫХ МЕХАНИЗМОВ
+==================================================
+
+REM После запуска тестов угроз проверить:
+REM 1. Все попытки несанкционированного доступа заблокированы
+REM 2. Порт 1883 (plaintext) закрыт
+REM 3. Порт 8884 (TLS) работает с mTLS
+REM 4. Wildcard подписки (#) заблокированы для IOT устройств
+REM 5. Публикация в command топики заблокирована для устройств
+REM 6. Все данные передаются через TLS
+
+REM Проверка портов после тестов
+netstat -ano | findstr :1883
+netstat -ano | findstr :8884
+
+REM Ожидается:
+REM - Порт 1883: нет вывода (закрыт)
+REM - Порт 8884: LISTENING (открыт для TLS)
+
+========================================
